@@ -1,56 +1,74 @@
-# build_dataset_full.py
+# Project/build_dataset_full.py
 # ------------------------------------------------------------
-# Genera dataset con TODOS los predios del cantón de Alajuela,
-# usando shapefiles catastrales y zonas homogéneas (ZH).
-# Consolida geometría por predio (PRM_IDENTI), calcula métricas
-# geométricas y cuenta ZH que intersectan usando STRtree.
+# Genera dataset con TODOS los predios usando la estructura:
+#
+# zhai-detector/
+# ├── Datasets/
+# │   ├── raw/
+# │   │   ├── CATASTRO_MAPA_PREDIAL/...
+# │   │   └── ZONAS_HOMOGENEAS_ALAJUELA/...
+# │   └── processed/
+# └── Project/
+#     └── build_dataset_full.py
 # ------------------------------------------------------------
 
 import os
 import gc
 import math
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.strtree import STRtree
 
 # ===========================
-# Configuración
+# Paths base
 # ===========================
-PATH_PREDIOS = "CATASTRO_MAPA_PREDIAL/MAPA_CATASTRAL.shp"
-PATH_ZH      = "ZONAS_HOMOGENEAS_ALAJUELA/ZONAS_HOMOGÉNEAS_2025.shp"
+HERE = Path(__file__).resolve()
+BASE_DIR = HERE.parents[1]           # carpeta zhai-detector/
+DATA_RAW = BASE_DIR / "Datasets" / "raw"
+DATA_PROCESSED = BASE_DIR / "Datasets" / "processed"
 
-OUT_DIR      = "outputs"
-OUT_CSV      = os.path.join(OUT_DIR, "predios_multizh_FULL.csv")
-OUT_PARQUET  = os.path.join(OUT_DIR, "predios_multizh_FULL.parquet")
+PATH_PREDIOS = DATA_RAW / "CATASTRO_MAPA_PREDIAL" / "MAPA_CATASTRAL.shp"
+PATH_ZH      = DATA_RAW / "ZONAS_HOMOGENEAS_ALAJUELA" / "ZONAS_HOMOGÉNEAS_2025.shp"
 
-BATCH = 5000          # Tamaño de lote (ajusta si tienes poca RAM)
-SIMPLIFY_TOL = 0.0    # Simplificación geométrica opcional (0.2 si tu CRS está en metros)
+OUT_DIR      = DATA_PROCESSED
+OUT_CSV      = OUT_DIR / "predios_multizh_FULL.csv"
+OUT_PARQUET  = OUT_DIR / "predios_multizh_FULL.parquet"
+
+BATCH = 5000
+SIMPLIFY_TOL = 0.0
 
 # ===========================
-# Funciones auxiliares
+# Helpers
 # ===========================
 def compactness(area, perimeter):
-    """Índice de forma del predio: 1 = circular, 0 = muy irregular"""
     if perimeter == 0 or np.isnan(area) or np.isnan(perimeter):
         return np.nan
     return 4 * np.pi * area / (perimeter ** 2)
 
 def strat_info(df, col="debe_actualizarse"):
-    """Resumen de distribución del target"""
     vc = df[col].value_counts(dropna=False)
     frac = (vc / vc.sum()).round(3)
     return pd.DataFrame({"count": vc, "frac": frac})
 
 def dedup_first(df, cols, id_col):
-    """Conserva una fila por predio para columnas no geométricas."""
     keep = [id_col] + [c for c in cols if c in df.columns]
     return df[keep].drop_duplicates(subset=[id_col], keep="first").copy()
 
 # ===========================
-# 1️⃣ Cargar shapefiles
+# 1) Carga shapefiles
 # ===========================
-print("Cargando shapefiles…")
+print("Usando rutas:")
+print("  Predios:", PATH_PREDIOS)
+print("  ZH     :", PATH_ZH)
+
+if not PATH_PREDIOS.exists():
+    raise FileNotFoundError(f"No se encontró {PATH_PREDIOS}. ¿Descomprimiste el ZIP en Datasets/raw?")
+if not PATH_ZH.exists():
+    raise FileNotFoundError(f"No se encontró {PATH_ZH}. ¿Descomprimiste el ZIP en Datasets/raw?")
+
+print("\nCargando shapefiles…")
 pred_raw = gpd.read_file(PATH_PREDIOS)
 zh       = gpd.read_file(PATH_ZH)
 
@@ -60,7 +78,7 @@ if pred_raw.crs != zh.crs:
 
 print(f"Predios (raw): {len(pred_raw)}  |  ZH: {len(zh)}")
 
-# Elegir ID principal (usa PRM_IDENTI si existe)
+# Elegir ID principal
 id_name = "PRM_IDENTI" if "PRM_IDENTI" in pred_raw.columns else "PREDIO"
 pred_raw[id_name] = pred_raw[id_name].astype(str)
 
@@ -69,20 +87,19 @@ if dup > 0:
     print(f"⚠️  Aviso: {dup} filas duplicadas por {id_name}. Se unificarán con dissolve.")
 
 # ===========================
-# 2️⃣ Consolidar geometría única por predio
+# 2) Geometría única por predio
 # ===========================
 print(f"Consolidando geometría única por {id_name} (dissolve)…")
 pred_u = pred_raw[[id_name, "geometry"]].dissolve(by=id_name, as_index=False)
 print(f"Predios únicos tras dissolve: {len(pred_u)}")
 
-# (Opcional) simplificación
 if SIMPLIFY_TOL > 0:
     print(f"Simplificando geometrías (tolerancia = {SIMPLIFY_TOL})…")
     pred_u["geometry"] = pred_u.geometry.simplify(SIMPLIFY_TOL, preserve_topology=True)
     zh["geometry"]     = zh.geometry.simplify(SIMPLIFY_TOL, preserve_topology=True)
 
 # ===========================
-# 3️⃣ STRtree y mapeo
+# 3) STRtree
 # ===========================
 print("Construyendo STRtree sobre ZH…")
 zh_geom = list(zh["geometry"].values)
@@ -91,12 +108,12 @@ zh_cod = zh["COD_ZONAH"].to_numpy()
 wkb_to_cod = {g.wkb: c for g, c in zip(zh_geom, zh_cod)}
 
 # ===========================
-# 4️⃣ Contar ZH por predio (procesamiento por lotes)
+# 4) Conteo de ZH por predio (por lotes)
 # ===========================
-os.makedirs(OUT_DIR, exist_ok=True)
-TMP_COUNTS = os.path.join(OUT_DIR, "_counts_tmp.csv")
-if os.path.exists(TMP_COUNTS):
-    os.remove(TMP_COUNTS)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+TMP_COUNTS = OUT_DIR / "_counts_tmp.csv"
+if TMP_COUNTS.exists():
+    TMP_COUNTS.unlink()
 
 n = len(pred_u)
 num_chunks = max(1, math.ceil(n / BATCH))
@@ -139,10 +156,10 @@ for i in range(num_chunks):
     del rows, ch
     gc.collect()
 
-print("✔ Conteos por predio guardados en (temporal):", TMP_COUNTS)
+print("✔ Conteos por predio guardados en:", TMP_COUNTS)
 
 # ===========================
-# 5️⃣ Calcular atributos geométricos
+# 5) Features geométricas
 # ===========================
 pred_geom = pred_u[[id_name, "geometry"]].copy()
 pred_geom["area_predio"]  = pred_geom.geometry.area.astype("float64")
@@ -153,15 +170,16 @@ pred_geom["compactness"]  = pred_geom.apply(
 pred_geom = pred_geom.drop(columns="geometry")
 
 # ===========================
-# 6️⃣ Atributos administrativos y uso
+# 6) Atributos admin / uso
 # ===========================
 admin_cols = [c for c in ["PRM_PROVIN", "PRM_CANTON", "PRM_DISTRI"] if c in pred_raw.columns]
 uso_cols   = [c for c in ["USO"] if c in pred_raw.columns]
+
 pred_admin = dedup_first(pred_raw, admin_cols, id_name)
 pred_uso   = dedup_first(pred_raw, uso_cols, id_name)
 
 # ===========================
-# 7️⃣ Combinar todo
+# 7) Ensamble final
 # ===========================
 counts = pd.read_csv(TMP_COUNTS)
 
@@ -173,7 +191,6 @@ df = df.merge(counts, on=id_name, how="left", validate="one_to_one")
 df["n_zh_unicas"]       = df["n_zh_unicas"].fillna(0).astype(int)
 df["debe_actualizarse"] = df["debe_actualizarse"].fillna(0).astype(int)
 
-# compactar tipos
 for col in ["PRM_PROVIN", "PRM_CANTON", "PRM_DISTRI", "USO"]:
     if col in df.columns:
         df[col] = df[col].astype("category")
@@ -185,7 +202,7 @@ print("\nDistribución del target (FULL):")
 print(strat_info(df, "debe_actualizarse"))
 
 # ===========================
-# 8️⃣ Guardar
+# 8) Guardar
 # ===========================
 df.to_csv(OUT_CSV, index=False)
 print("\nCSV guardado ->", OUT_CSV, df.shape)
@@ -196,10 +213,7 @@ try:
 except Exception as e:
     print("Parquet no guardado (opcional):", e)
 
-try:
-    os.remove(TMP_COUNTS)
-except Exception:
-    pass
+if TMP_COUNTS.exists():
+    TMP_COUNTS.unlink()
 
-print("\n✅ Listo: dataset con TODOS los predios (82k filas).")
-    
+print("\n✅ Listo: dataset con TODOS los predios generado en Datasets/processed/")
